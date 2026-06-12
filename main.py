@@ -1,52 +1,35 @@
 """
-╔══════════════════════════════════════════════════════════════════╗
-║          🌐  GLOBAL AI CHATBOT  v3.0                            ║
-╠══════════════════════════════════════════════════════════════════╣
-║  STT   → Groq Whisper (whisper-large-v3)                        ║
-║  LLM   → Groq LLaMA 3.3 70B  +  Smart Web Search Tool          ║
-║  TTS   → Microsoft Edge TTS (edge-tts, 100% free)               ║
-║  SEARCH→ DuckDuckGo (duckduckgo-search, cached + timeout)       ║
-║  UI    → Terminal only (rich colored output)                     ║
-╚══════════════════════════════════════════════════════════════════╝
+============================================================
+  🌐 GlobalBot — Simple Speech-to-Speech AI Assistant
+============================================================
+  Stack:
+    STT    → Groq Whisper (whisper-large-v3)
+    LLM    → Groq LLaMA 3.3 70B
+    TTS    → Microsoft Edge TTS (edge-tts, free)
+    SEARCH → DuckDuckGo API (urllib, zero extra packages)
 
-v3.0 Changes (over v2.1):
-  - Hybrid live-data classifier: fast regex pre-filter + lightweight
-    LLM (llama-3.1-8b-instant) for ambiguous queries. Eliminates
-    both false positives (unnecessary searches) and false negatives
-    (missed current-event questions that regex couldn't catch).
-  - Filler-word removal from transcriptions (from Code B).
-  - Improved Hindi detection: Whisper tag + Devanagari scan + Roman
-    Hindi keyword list (from Code B).
-  - Context enrichment for short follow-up queries (from Code B).
-  - is_only_fillers() guard prevents empty transcripts reaching LLM.
-  - All Code A strengths preserved: startup self-test, GPIO, DDGS,
-    search cache, timeout, Wikipedia fallback, error recovery, state
-    machine, regex wake-word, history, Edge TTS.
+  Features:
+    • Answers all types of questions (science, history, tech, etc.)
+    • Live web search for current events and news
+    • Auto language detection: English ↔ Hindi
+    • Idle mode after 10 seconds of silence
+    • Multi-key fallback (up to 5 Groq API keys)
+    • Internet / server connectivity announcements
+============================================================
 """
 
 import os
-import sys
 import asyncio
 import tempfile
 import queue
 import time
-import threading
 import re
+import urllib.request
+import urllib.parse
 import json
-import logging
-import socket
-import concurrent.futures
-from datetime import datetime
-from zoneinfo import ZoneInfo
+import html
 from enum import Enum
 from typing import Optional, Tuple
-
-# ── Wikipedia fallback ─────────────────────────────────────────────
-try:
-    import wikipedia as _wikipedia_module
-    WIKIPEDIA_AVAILABLE = True
-except ImportError:
-    WIKIPEDIA_AVAILABLE = False
 
 import numpy as np
 import sounddevice as sd
@@ -56,586 +39,384 @@ import edge_tts
 import pygame
 from dotenv import load_dotenv
 
-# ── DuckDuckGo search ─────────────────────────────────────────────
+# Groq exception classes (used for detecting rate-limit / quota errors).
+# Wrapped in try/except so the script still runs even if the SDK's
+# exception names ever change.
 try:
-    from duckduckgo_search import DDGS
-    DDGS_AVAILABLE = True
-except ImportError:
-    DDGS_AVAILABLE = False
-
-# ── GPIO (Raspberry Pi only) ──────────────────────────────────────
-try:
-    import RPi.GPIO as GPIO
-    GPIO_AVAILABLE = True
-except ImportError:
-    GPIO_AVAILABLE = False
+    from groq import RateLimitError, APIConnectionError, APIStatusError
+except ImportError:  # pragma: no cover - safety fallback
+    RateLimitError = APIConnectionError = APIStatusError = Exception
 
 load_dotenv()
 
-logging.basicConfig(
-    level=logging.WARNING,
-    format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
-    datefmt="%H:%M:%S",
-)
-logger = logging.getLogger("globalbot")
+# ──────────────────────────────────────────────
+#  CONFIG
+# ──────────────────────────────────────────────
 
-# ─────────────────────────────────────────────────────────────────
-#  TERMINAL COLORS
-# ─────────────────────────────────────────────────────────────────
+# Up to 5 Groq API keys. Define GROQ_API_KEY_1 ... GROQ_API_KEY_5 in your
+# .env file. For backward compatibility, GROQ_API_KEY (no suffix) is also
+# accepted as one of the keys if the numbered ones aren't set.
+_RAW_KEYS = [
+    os.getenv("GROQ_API_KEY_1"),
+    os.getenv("GROQ_API_KEY_2"),
+    os.getenv("GROQ_API_KEY_3"),
+    os.getenv("GROQ_API_KEY_4"),
+    os.getenv("GROQ_API_KEY_5"),
+]
 
-class C:
-    RESET   = "\033[0m"
-    BOLD    = "\033[1m"
-    CYAN    = "\033[96m"
-    GREEN   = "\033[92m"
-    YELLOW  = "\033[93m"
-    MAGENTA = "\033[95m"
-    BLUE    = "\033[94m"
-    RED     = "\033[91m"
-    GREY    = "\033[90m"
-    WHITE   = "\033[97m"
+# Fall back to the old single GROQ_API_KEY if no numbered keys were given.
+if not any(_RAW_KEYS) and os.getenv("GROQ_API_KEY"):
+    _RAW_KEYS = [os.getenv("GROQ_API_KEY")]
 
-def banner(text: str, color: str = C.CYAN):
-    width = 68
-    print(f"\n{color}{C.BOLD}{'─' * width}")
-    print(f"  {text}")
-    print(f"{'─' * width}{C.RESET}")
+GROQ_API_KEYS = [k for k in _RAW_KEYS if k]
 
-def log_user(text: str, lang: str):
-    tag = f"{C.BLUE}[YOU/{lang.upper()}]{C.RESET}"
-    print(f"\n{tag}  {C.WHITE}{C.BOLD}{text}{C.RESET}")
+if not GROQ_API_KEYS:
+    raise RuntimeError(
+        "No Groq API keys found. Please set GROQ_API_KEY_1 .. GROQ_API_KEY_5 "
+        "(or GROQ_API_KEY) in your .env file."
+    )
 
-def log_bot(text: str, lang: str):
-    tag = f"{C.GREEN}[BOT/{lang.upper()}]{C.RESET}"
-    print(f"{tag}  {C.CYAN}{text}{C.RESET}")
+STT_MODEL  = "whisper-large-v3"
+CHAT_MODEL = "llama-3.3-70b-versatile"
 
-def log_search(query: str, mode: str = "web"):
-    icon = "📰" if mode == "news" else "🔍"
-    print(f"  {C.YELLOW}{icon} Searching [{mode}]:{C.RESET}  {query}")
+TTS_VOICE_EN = "en-US-JennyNeural"
+TTS_VOICE_HI = "hi-IN-SwaraNeural"
 
-def log_cache_hit(query: str):
-    print(f"  {C.GREEN}⚡ Cache hit:{C.RESET}  {query[:80]}")
+SAMPLE_RATE = 16000
+CHANNELS    = 1
+MAX_TOKENS  = 400
 
-def log_result(snippet: str):
-    preview = snippet[:120].replace("\n", " ")
-    print(f"  {C.GREY}📄 Result:   {preview}...{C.RESET}")
-
-def log_state(msg: str):
-    print(f"  {C.MAGENTA}◆ {msg}{C.RESET}")
-
-def log_warn(msg: str):
-    print(f"  {C.RED}⚠  {msg}{C.RESET}")
-
-def log_error(msg: str):
-    print(f"  {C.RED}{C.BOLD}✖  {msg}{C.RESET}")
-
-def log_pass(label: str):
-    print(f"    {C.GREEN}✔  {label}{C.RESET}")
-
-def log_fail(label: str):
-    print(f"    {C.RED}✖  {label}{C.RESET}")
-
-# ─────────────────────────────────────────────────────────────────
-#  MODEL / API CONFIG
-# ─────────────────────────────────────────────────────────────────
-
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-if not GROQ_API_KEY:
-    sys.exit("❌  GROQ_API_KEY not set. Add it to your .env file.")
-
-CHAT_MODEL      = "llama-3.3-70b-versatile"
-CLASSIFIER_MODEL = "llama-3.1-8b-instant"   # lightweight model for intent classification
-
-STT_MODEL      = "whisper-large-v3"
-STT_MODEL_FAST = "whisper-large-v3-turbo"
-
-TTS_VOICE_EN   = "en-IN-NeerjaNeural"
-TTS_VOICE_HI   = "hi-IN-SwaraNeural"
-
-# ─────────────────────────────────────────────────────────────────
-#  AUDIO CONFIG
-# ─────────────────────────────────────────────────────────────────
-
-SAMPLE_RATE          = 16_000
-CHANNELS             = 1
-CHUNK_SECS           = 0.1
-ENERGY_THRESHOLD     = 0.010
+ENERGY_THRESHOLD     = 0.035
 SILENCE_AFTER_SPEECH = 0.8
 PRE_ROLL_CHUNKS      = 6
 MIN_SPEECH_SECS      = 0.5
+CHUNK_SECS           = 0.25
 
-# ─────────────────────────────────────────────────────────────────
-#  BEHAVIOUR CONFIG
-# ─────────────────────────────────────────────────────────────────
+IDLE_TIMEOUT      = 10.0   # seconds of silence before going idle
+IDLE_POLL_TIMEOUT = 30.0   # how long to wait in idle before polling again
 
-MAX_TOKENS       = 400
-CHAT_TEMPERATURE = 0.6
+WAKE_WORDS = ["hello", "hey", "globalbot", "hello bot", "hey bot",
+              "hello globalbot", "hey globalbot"]
 
-IDLE_TIMEOUT      = 10.0
-IDLE_POLL_TIMEOUT = 60.0
-HISTORY_WINDOW    = 10
-SEARCH_TIMEOUT_SECS = 6
-
-GREEN_LED_PIN = 18
-
-# ─────────────────────────────────────────────────────────────────
-#  WAKE WORDS
-# ─────────────────────────────────────────────────────────────────
-
-_WAKE_PATTERNS = [
-    r"\bhello\b",
-    r"\bhey\b",
-    r"\bhi\b",
-    r"\bokay\s+bot\b",
-    r"\bhey\s+bot\b",
-    r"\bglobalbot\b",
-    r"\bbot\b",
+# Keywords that suggest the question needs a live web search
+SEARCH_TRIGGERS = [
+    # English
+    "latest", "recent", "current", "today", "yesterday", "this week",
+    "this month", "this year", "2024", "2025", "2026", "news", "update",
+    "score", "result", "match", "election", "winner", "died", "launched",
+    "released", "announced", "price", "stock", "weather", "live",
+    "who is", "what is the latest", "what happened",
+    # Hindi (Roman)
+    "aaj", "kal", "abhi", "haal", "taza", "khabar", "result",
+    "score", "match", "chunav", "mausam",
 ]
-_WAKE_REGEXES = [re.compile(p, re.IGNORECASE) for p in _WAKE_PATTERNS]
 
-# ─────────────────────────────────────────────────────────────────
+# Messages spoken for connectivity issues
+NO_INTERNET_MESSAGE = {
+    "en": "I can't connect to the internet. Please check your connection.",
+    "hi": "Internet se connect nahi ho pa raha hai. Apna connection check karein.",
+}
+
+NO_SERVER_MESSAGE = {
+    "en": "I can't connect to the server right now. Please try again later.",
+    "hi": "Abhi server se connect nahi ho pa raha hai. Kripya thodi der baad try karein.",
+}
+
+# ──────────────────────────────────────────────
 #  SYSTEM PROMPTS
-# ─────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────
 
-SYSTEM_EN = """\
-You are GlobalBot, a friendly and knowledgeable AI assistant that can answer questions on ANY topic.
-You have access to a web_search tool.
+SYSTEM_EN = """
+M A B F M  school is one of the top schools of khajrana indore which is located near dargah main road. 
+YOU ARE MADE BY ROBOTWALA .
+You are a simple AI assistant.
 
-Use web_search ONLY when the question involves:
-  - Current news, recent events, or breaking stories
-  - Live data: weather, sports scores, stock prices, flight status
-  - Facts that change over time (e.g. "Who is the current PM of India?")
-  - Specific statistics or data you are not certain about
+Rules:
+- Answer only the user's question.
+- Keep answers very short: maximum 1-2 sentences.
+- Do not give long explanations unless explicitly asked.
+- Be direct and accurate.
+- No bullet points or markdown formatting.
 
-Do NOT use web_search for:
-  - General knowledge, science, history, math, definitions
-  - Conversational questions ("how are you", "tell me a joke")
-  - Stable facts you already know with confidence
-
-Rules for your spoken reply:
-  - Keep every reply under 3 sentences. This is a voice interface.
-  - Speak naturally — no bullet points, no markdown, no emoji.
-  - Be concise but complete. Prioritise the single most useful fact.
-  - Never refuse a general-knowledge question.
 """
 
-SYSTEM_HI = """\
-Aap GlobalBot hain — ek friendly AI assistant jo kisi bhi topic par jawab de sakta hai.
-Aapke paas web_search tool hai.
-
-web_search tab hi use karein jab sawaal ho:
-  - Current news, recent events, breaking stories ke baare mein
-  - Live data: mausam, sports scores, stock prices
-  - Aisi jaankari jo time ke saath badlti hai
-  - Specific facts jo aapko confirm karne hon
-
-web_search mat karein:
-  - General knowledge, science, history, math, definitions ke liye
-  - Casual baatcheet ke liye
-  - Stable facts ke liye jo aapko pehle se pata hain
-
-Jawab dene ke niyam:
-  - Roman/Latin script mein jawab dein — Devanagari bilkul mat use karein.
-  - 3 sentence se zyada mat bolein. Yeh voice interface hai.
-  - Koi bullet points, markdown ya emoji nahi.
+SYSTEM_HI = """
+M A B F M School khajrana ka ek mash-hoor school hai , jo ki dargah main road pr sthit hai .
+Aap ek simple AI assistant hain.
+TUMHE ROBOTWALA NE BANAYA HAI . 
+Rules:
+- Sirf user ke question ka jawab dein.
+- Jawab bahut chhota rakhein: maximum 1-2 sentences.
+- Jab tak user na kahe, lambi explanation mat dein.
+- Seedha aur accurate jawab dein.
+- Koi bullet points ya markdown formatting mat use karein.
 """
 
-# ─────────────────────────────────────────────────────────────────
-#  WEB SEARCH TOOL DEFINITION
-# ─────────────────────────────────────────────────────────────────
-
-WEB_SEARCH_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "web_search",
-        "description": (
-            "Search the internet for current, real-time, or factual information. "
-            "Use ONLY for: current news, live sports scores, weather, stock prices, "
-            "recent events, or facts that may have changed recently. "
-            "Do NOT use for stable general knowledge questions."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "A precise web search query string.",
-                }
-            },
-            "required": ["query"],
-        },
-    },
-}
-
-# ─────────────────────────────────────────────────────────────────
-#  NEWS QUERY DETECTION
-# ─────────────────────────────────────────────────────────────────
-
-_NEWS_KEYWORDS = re.compile(
-    r"\b(news|latest|today|yesterday|breaking|headline|update|"
-    r"current|recent|right now|this week|this month|score|"
-    r"match|result|election|winner|died|arrested|launched|"
-    r"announced|released|happened)\b",
-    re.IGNORECASE,
-)
-
-def _is_news_query(query: str) -> bool:
-    return bool(_NEWS_KEYWORDS.search(query))
-
-# ─────────────────────────────────────────────────────────────────
-#  HYBRID LIVE-DATA CLASSIFIER
-#
-#  Strategy: 3-tier decision pipeline
-#
-#  Tier A — DEFINITE NO (fast regex):
-#    Pure greetings, math, definitions, basic science → skip search.
-#    Cost: ~0 ms, 0 tokens.
-#
-#  Tier B — DEFINITE YES (fast regex):
-#    Strong temporal/live-data signals → always search.
-#    Cost: ~0 ms, 0 tokens.
-#    Catches: "who won yesterday", "weather today", "latest NVIDIA GPU",
-#    "what happened in Iran", "OpenAI release recently".
-#
-#  Tier C — AMBIGUOUS → LLM classifier (llama-3.1-8b-instant):
-#    Queries that pass both regex tiers without a clear decision.
-#    The small model answers YES/NO in ~0.3-0.5 s on Groq's fast lane.
-#    Much cheaper than the full 70B model; adds minimal latency.
-#    Cost: ~80-120 input tokens + 5 output tokens per ambiguous query.
-#
-#  Why not pure regex?
-#    Regex misses paraphrased current-event questions:
-#      "Tell me about Groq's newest models" (no temporal keyword)
-#      "What is Iran situation" (no keyword, but clearly live)
-#      "Latest NVIDIA cards" ("latest" is borderline in regex)
-#
-#  Why not pure LLM?
-#    Adds ~0.5 s to every single query including "what is 2+2".
-#    Wastes tokens; increases cost on repeated obvious queries.
-#
-#  The hybrid gives best-of-both: free instant decisions for clear
-#  cases, smart LLM fallback only for genuinely ambiguous ones.
-# ─────────────────────────────────────────────────────────────────
-
-# Queries that clearly do NOT need live data
-_DEFINITE_NO_RE = re.compile(
-    r"^\s*("
-    r"(what is|what are|define|explain|how does|how do|why is|why are|"
-    r"tell me about|describe|who was|who were|when was|when did|"
-    r"what was|history of|origin of|meaning of|difference between|"
-    r"how to|can you|do you|are you|will you|could you)"
-    r"\s+(?!.*\b(latest|current|now|today|recent|new|update|release|"
-    r"happening|going on|right now|breaking|this year|2024|2025|2026)\b)"
-    r")",
-    re.IGNORECASE,
-)
-
-# Queries that clearly DO need live data — comprehensive
-_DEFINITE_YES_RE = re.compile(
-    r"\b("
-    # Strong temporal signals
-    r"today|tonight|tomorrow|yesterday|right now|just now|"
-    r"this (morning|evening|afternoon|night|week|month|year)|"
-    r"last (night|week|month|year|hour)|"
-    r"currently|at the moment|as of now|"
-    r"recent(ly)?|latest|newest|brand new|just (released|launched|announced|dropped)|"
-    r"breaking|live|real.?time|"
-    # Current office-holders — often missed by simple regex
-    r"current (president|pm|prime minister|cm|chief minister|ceo|chairman|"
-    r"captain|minister|governor|chancellor|director|head|leader)|"
-    r"who (is|are) (the )?(current|now|today)|"
-    r"who (leads|heads|runs|owns|controls) (the )?[a-z]|"
-    # Tech/product releases — the biggest miss in Code A
-    r"(latest|new|newest|recent|updated?) (model|version|release|update|"
-    r"gpu|chip|phone|laptop|car|product|feature|api|tool)|"
-    r"just (came out|released|launched|announced|dropped)|"
-    r"what('?s| has| have) .{0,30} (released|launched|announced|done lately)|"
-    # News / events
-    r"news|headline|breaking|update|situation|happening|"
-    r"what('?s| is) (going on|happening) in|"
-    r"(war|conflict|crisis|protest|election|vote|result|score|match|"
-    r"tournament|championship|final|semi.?final)|"
-    r"(won|lost|beat|defeated|elected|appointed|resigned|arrested|"
-    r"killed|died|passed away|launched|released|announced|signed)|"
-    # Finance / weather
-    r"(stock|share|price|market|sensex|nifty|nasdaq|dow|crypto|bitcoin|"
-    r"weather|forecast|temperature|rain|flood|earthquake)|"
-    # Hindi time/news words (Roman)
-    r"aaj|kal|abhi|haal|taza khabar|abhi kya|kya ho raha"
-    r")\b",
-    re.IGNORECASE,
-)
-
-# Classifier system prompt — kept minimal for speed
-_CLASSIFIER_SYSTEM = (
-    "You are a query classifier. Respond with ONLY the word YES or NO.\n"
-    "YES = the question requires current/live/recent internet information to answer correctly.\n"
-    "NO  = the question can be answered from general knowledge.\n"
-    "Examples:\n"
-    "Q: What is photosynthesis? → NO\n"
-    "Q: Who is the current CEO of OpenAI? → YES\n"
-    "Q: Tell me about Groq's newest models. → YES\n"
-    "Q: What is happening in Iran? → YES\n"
-    "Q: How far is the moon from Earth? → NO\n"
-    "Q: Latest NVIDIA GPU? → YES\n"
-    "Q: Did OpenAI release anything recently? → YES\n"
-    "Q: What is machine learning? → NO\n"
-    "Q: Who won yesterday's IPL match? → YES\n"
-    "Q: Tell me a joke. → NO\n"
-)
-
-def _llm_classify_live(query: str) -> bool:
-    """
-    Ask llama-3.1-8b-instant whether the query needs live internet data.
-    Returns True (needs search) or False (can use LLM knowledge).
-    Falls back to True on any error (safer to over-search than under-search).
-    Target latency on Groq: ~300-500 ms.
-    """
-    try:
-        resp = client.chat.completions.create(
-            model=CLASSIFIER_MODEL,
-            messages=[
-                {"role": "system", "content": _CLASSIFIER_SYSTEM},
-                {"role": "user",   "content": f"Q: {query}"},
-            ],
-            max_tokens=5,
-            temperature=0.0,
-        )
-        answer = resp.choices[0].message.content.strip().upper()
-        return answer.startswith("Y")
-    except Exception as exc:
-        logger.warning("LLM classifier failed, defaulting to YES: %s", exc)
-        return True   # fail-safe: search rather than give stale answer
-
-
-def requires_live_data(query: str, last_user_text: str = "") -> bool:
-    """
-    Hybrid live-data detector. Returns True if a web search should run.
-
-    Pipeline:
-      1. Definite-NO regex  → return False immediately.
-      2. Definite-YES regex → return True immediately.
-      3. Ambiguous          → ask llama-3.1-8b-instant (fast, cheap).
-
-    The last_user_text context is appended to catch follow-ups like
-    "did they win?" after a sports discussion.
-    """
-    # Build context-enriched text for classification
-    full_text = query
-    if last_user_text and len(query.split()) <= 6:
-        # Short follow-up: enrich with prior context so classifier
-        # can correctly classify "did they win?" as live-data
-        full_text = f"{last_user_text} | {query}"
-
-    # Tier A: clear NO
-    if _DEFINITE_NO_RE.match(full_text):
-        # Double-check: even stable-looking questions might carry live signals
-        if not _DEFINITE_YES_RE.search(full_text):
-            return False
-
-    # Tier B: clear YES
-    if _DEFINITE_YES_RE.search(full_text):
-        return True
-
-    # Tier C: ambiguous — use lightweight LLM classifier
-    log_state("Ambiguous query — running LLM classifier...")
-    return _llm_classify_live(full_text)
-
-
-# ─────────────────────────────────────────────────────────────────
-#  DATE/TIME QUERY DETECTION
-# ─────────────────────────────────────────────────────────────────
-
-_TIME_QUERY_RE = re.compile(
-    r"\b("
-    r"what time|current time|time is it|time now|"
-    r"what('?s| is) today|today('?s)? date|today('?s)? day|"
-    r"what day|which day|day of the week|"
-    r"date today|current date|"
-    r"what('?s| is) the date"
-    r")\b",
-    re.IGNORECASE,
-)
-
-def is_time_query(query: str) -> bool:
-    return bool(_TIME_QUERY_RE.search(query))
-
-def get_local_datetime() -> str:
-    now = datetime.now(ZoneInfo("Asia/Kolkata"))
-    return now.strftime("It is %-I:%M %p on %A, %-d %B %Y (IST).")
-
-# ─────────────────────────────────────────────────────────────────
-#  TRANSCRIPTION HELPERS  (from Code B — improved Hindi detection)
-# ─────────────────────────────────────────────────────────────────
-
-_FILLER_WORDS = {
-    "hmm", "hmmm", "umm", "um", "uh", "uhh", "ah", "ahh",
-    "mmm", "mm", "huh", "er", "erm", "accha", "acha", "achha",
-    "haan", "han", "theek", "theek hai", "haanji",
-    "mm-hmm", "mhm", "uh-huh", "okay", "ok", "right",
-    "yeah", "yep", "yup",
-}
-
-_HINDI_ROMAN_WORDS = {
-    "hai", "haan", "nahi", "kya", "kaise", "kitna", "kitni",
-    "aap", "tum", "hum", "mein", "main", "kab", "ka", "ki",
-    "kar", "karna", "sakta", "sakti", "jana", "chahiye",
-    "batao", "bolo", "bata", "karo", "dono", "kyun", "kyunki",
-    "lekin", "aur", "ya", "agar", "toh", "woh", "yeh", "iska",
-    "uska", "inhe", "unhe", "accha", "theek", "bilkul",
-}
-
-def clean_transcription(text: str) -> str:
-    """Remove standalone filler words from transcription."""
-    words = text.split()
-    cleaned = [w for w in words if w.lower().strip(".,!?") not in _FILLER_WORDS]
-    return " ".join(cleaned).strip()
-
-def is_only_fillers(text: str) -> bool:
-    """Return True if the transcription contains nothing useful."""
-    if not text:
-        return True
-    return clean_transcription(text).strip() == ""
-
-# ─────────────────────────────────────────────────────────────────
-#  SEARCH CACHE
-# ─────────────────────────────────────────────────────────────────
-
-search_cache: dict[str, str] = {}
-
-def _cache_key(query: str) -> str:
-    return query.lower().strip()
-
-# ─────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────
 #  STATE
-# ─────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────
 
 class State(Enum):
     IDLE      = "idle"
     LISTENING = "listening"
     SPEAKING  = "speaking"
-    THINKING  = "thinking"
 
-# ─────────────────────────────────────────────────────────────────
-#  GPIO
-# ─────────────────────────────────────────────────────────────────
 
-def gpio_setup():
-    if not GPIO_AVAILABLE:
-        return
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setup(GREEN_LED_PIN, GPIO.OUT)
-    GPIO.output(GREEN_LED_PIN, GPIO.LOW)
+# ──────────────────────────────────────────────
+#  CUSTOM EXCEPTIONS (connectivity)
+# ──────────────────────────────────────────────
 
-def gpio_set(on: bool):
-    if GPIO_AVAILABLE:
-        GPIO.output(GREEN_LED_PIN, GPIO.HIGH if on else GPIO.LOW)
+class NoInternetError(Exception):
+    """Raised when there is no internet connection at all."""
+    pass
 
-def gpio_cleanup():
-    if GPIO_AVAILABLE:
-        GPIO.cleanup()
 
-# ─────────────────────────────────────────────────────────────────
-#  GROQ CLIENT
-# ─────────────────────────────────────────────────────────────────
+class AllKeysExhaustedError(Exception):
+    """Raised when every Groq API key has hit its rate limit / quota."""
+    pass
 
-client   = Groq(api_key=GROQ_API_KEY)
-_history = {"en": [], "hi": []}
 
-# Per-language tracker for last user utterance — used for follow-up
-# context enrichment (Code B idea) and classifier context.
-_last_user_text: dict[str, str] = {"en": "", "hi": ""}
+# ──────────────────────────────────────────────
+#  SETUP
+# ──────────────────────────────────────────────
 
-# ─────────────────────────────────────────────────────────────────
-#  STARTUP SELF-TEST
-# ─────────────────────────────────────────────────────────────────
+current_key_index = 0
+client = Groq(api_key=GROQ_API_KEYS[current_key_index])
 
-def run_self_test() -> bool:
-    banner("🔧  GlobalBot v3.0 — Startup Self-Test", C.YELLOW)
-    all_ok = True
+history = {"en": [], "hi": []}
+last_user_text = ""
 
-    # 1. Groq API
+pygame.mixer.init()
+
+
+# ══════════════════════════════════════════════
+#  CONNECTIVITY HELPERS
+# ══════════════════════════════════════════════
+
+def has_internet(timeout: float = 3.0) -> bool:
+    """Quick check for a working internet connection."""
+    test_urls = [
+        "https://www.google.com",
+        "https://1.1.1.1",
+        "https://api.groq.com",
+    ]
+    for url in test_urls:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "GlobalBot/1.0"})
+            urllib.request.urlopen(req, timeout=timeout)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _is_quota_or_rate_limit_error(e: Exception) -> bool:
+    """Heuristic check for 'this key is out of quota / rate-limited' errors."""
+    if isinstance(e, RateLimitError):
+        return True
+
+    msg = str(e).lower()
+    keywords = [
+        "rate limit", "rate_limit", "ratelimit",
+        "quota", "429", "insufficient_quota",
+        "exceeded", "too many requests",
+    ]
+    return any(k in msg for k in keywords)
+
+
+def _is_connection_error(e: Exception) -> bool:
+    """Heuristic check for network/connection failures (no internet)."""
+    if isinstance(e, APIConnectionError):
+        return True
+
+    msg = str(e).lower()
+    keywords = [
+        "connection", "network", "timed out", "timeout",
+        "name or service not known", "failed to resolve",
+        "max retries exceeded", "temporary failure in name resolution",
+    ]
+    return any(k in msg for k in keywords)
+
+
+def call_groq_with_fallback(call_fn):
+    """
+    Call `call_fn(client)` using the current Groq API key.
+    If that key is rate-limited / out of quota, automatically rotate
+    through the remaining keys.
+
+    Raises:
+        NoInternetError       - if there's no internet connection at all.
+        AllKeysExhaustedError - if every API key is rate-limited/out of quota.
+        Exception             - any other unexpected error is re-raised.
+    """
+    global current_key_index, client
+
+    # First, make sure we actually have internet at all.
+    if not has_internet():
+        raise NoInternetError("No internet connection detected.")
+
+    n = len(GROQ_API_KEYS)
+    start = current_key_index
+    last_quota_error: Optional[Exception] = None
+
+    for offset in range(n):
+        idx = (start + offset) % n
+        try:
+            active_client = Groq(api_key=GROQ_API_KEYS[idx])
+            result = call_fn(active_client)
+
+            # Success — remember this key as the current one.
+            if idx != current_key_index:
+                print(f"   🔄 Switched to Groq API key #{idx + 1}")
+            current_key_index = idx
+            client = active_client
+            return result
+
+        except Exception as e:
+            if _is_quota_or_rate_limit_error(e):
+                print(f"   ⚠️ API key #{idx + 1} exhausted/rate-limited: {e}")
+                last_quota_error = e
+                continue
+
+            if _is_connection_error(e):
+                # Could not reach the server even though basic internet
+                # check passed — treat as a server connectivity issue.
+                raise AllKeysExhaustedError(str(e)) from e
+
+            # Any other error (auth issue, bad request, etc.) — re-raise.
+            raise
+
+    # All keys tried and all hit rate limit / quota errors.
+    raise AllKeysExhaustedError(
+        "All configured Groq API keys are rate-limited or out of quota."
+    ) from last_quota_error
+
+
+# ══════════════════════════════════════════════
+#  WEB SEARCH
+# ══════════════════════════════════════════════
+
+def needs_web_search(text: str) -> bool:
+    lower = text.lower()
+    return any(trigger in lower for trigger in SEARCH_TRIGGERS)
+
+
+def web_search(query: str, max_results: int = 5) -> str:
+    """Search DuckDuckGo Instant Answer API using built-in urllib."""
     try:
-        test_resp = client.chat.completions.create(
-            model=CHAT_MODEL,
-            messages=[{"role": "user", "content": "ping"}],
-            max_tokens=5,
-        )
-        if test_resp.choices:
-            log_pass(f"Groq API  ({CHAT_MODEL})")
-        else:
-            raise ValueError("Empty response")
-    except Exception as exc:
-        log_fail(f"Groq API — {exc}")
-        all_ok = False
+        print(f"   🔍 Searching: {query!r}")
+        params = urllib.parse.urlencode({
+            "q": query,
+            "format": "json",
+            "no_html": "1",
+            "skip_disambig": "1",
+        })
+        url = f"https://api.duckduckgo.com/?{params}"
+        req = urllib.request.Request(url, headers={"User-Agent": "GlobalBot/1.0"})
 
-    # 2. Internet
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+
+        results = []
+
+        abstract = data.get("AbstractText", "").strip()
+        if abstract:
+            source = data.get("AbstractSource", "")
+            results.append(f"{source}: {abstract}" if source else abstract)
+
+        answer = data.get("Answer", "").strip()
+        if answer:
+            results.append(f"Direct answer: {answer}")
+
+        for topic in data.get("RelatedTopics", [])[:max_results]:
+            text = topic.get("Text", "").strip()
+            if text and len(text) > 20:
+                results.append(html.unescape(text))
+            for sub in topic.get("Topics", [])[:2]:
+                sub_text = sub.get("Text", "").strip()
+                if sub_text and len(sub_text) > 20:
+                    results.append(html.unescape(sub_text))
+
+        if not results:
+            results = _ddg_lite_search(query, max_results)
+
+        if not results:
+            return ""
+
+        print(f"   ✅ Got {len(results)} result(s)")
+        return "\n\n".join(results[:max_results])
+
+    except Exception as e:
+        print(f"   ⚠️ Search failed: {e}")
+        return ""
+
+
+def _ddg_lite_search(query: str, max_results: int = 4) -> list:
+    """Fallback: scrape DuckDuckGo lite (plain HTML, no JS)."""
     try:
-        socket.setdefaulttimeout(4)
-        socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect(("8.8.8.8", 53))
-        log_pass("Internet connectivity")
+        params = urllib.parse.urlencode({"q": query, "kl": "in-en"})
+        url = f"https://lite.duckduckgo.com/lite/?{params}"
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        })
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            page = resp.read().decode("utf-8", errors="ignore")
+
+        snippets = []
+        marker = "result-snippet"
+        pos = 0
+        while len(snippets) < max_results:
+            idx = page.find(marker, pos)
+            if idx == -1:
+                break
+            start = page.find(">", idx) + 1
+            end   = page.find("</td>", start)
+            if start == 0 or end == -1:
+                pos = idx + 1
+                continue
+            raw = page[start:end].strip()
+            clean = re.sub(r"<[^>]+>", "", raw).strip()
+            clean = html.unescape(clean)
+            if len(clean) > 20:
+                snippets.append(clean)
+            pos = end
+
+        return snippets
     except Exception:
-        log_fail("Internet connectivity — no network access")
-        all_ok = False
+        return []
 
-    # 3. Microphone
-    try:
-        devices = sd.query_devices()
-        input_devs = [d for d in devices if d["max_input_channels"] > 0]
-        if input_devs:
-            log_pass(f"Microphone ({input_devs[0]['name'][:40]})")
-        else:
-            raise RuntimeError("No input device found")
-    except Exception as exc:
-        log_fail(f"Microphone — {exc}")
-        all_ok = False
 
-    # 4. Speaker
-    try:
-        devices = sd.query_devices()
-        output_devs = [d for d in devices if d["max_output_channels"] > 0]
-        if output_devs:
-            log_pass(f"Speaker   ({output_devs[0]['name'][:40]})")
-        else:
-            raise RuntimeError("No output device found")
-    except Exception as exc:
-        log_fail(f"Speaker — {exc}")
-        all_ok = False
+def build_system_with_search(query: str, lang: str) -> str:
+    """Inject web search results into the system prompt if needed."""
+    base = SYSTEM_HI if lang == "hi" else SYSTEM_EN
 
-    # 5. DDGS
-    if DDGS_AVAILABLE:
-        log_pass("DuckDuckGo search library (DDGS)")
-    else:
-        log_warn("DDGS not installed — using Instant Answer API fallback")
-        log_warn("  Run: pip install duckduckgo-search")
+    if not needs_web_search(query):
+        return base
 
-    # 6. Classifier model (quick smoke test)
-    try:
-        test_cls = client.chat.completions.create(
-            model=CLASSIFIER_MODEL,
-            messages=[{"role": "user", "content": "ping"}],
-            max_tokens=5,
+    context = web_search(query)
+    if not context:
+        return base
+
+    if lang == "hi":
+        inject = (
+            "\n\nWeb search se mili latest jaankari (isko apne jawab mein use karo):\n\n"
+            + context
         )
-        if test_cls.choices:
-            log_pass(f"Classifier model ({CLASSIFIER_MODEL})")
-        else:
-            raise ValueError("Empty response")
-    except Exception as exc:
-        log_fail(f"Classifier model — {exc}  (ambiguous queries will default to search)")
-
-    print()
-    if all_ok:
-        print(f"  {C.GREEN}{C.BOLD}All systems ready.{C.RESET}\n")
     else:
-        print(f"  {C.YELLOW}{C.BOLD}Some checks failed — bot will still try to run.{C.RESET}\n")
+        inject = (
+            "\n\nWeb search results for this query (use this to answer accurately):\n\n"
+            + context
+        )
 
-    return all_ok
+    return base + inject
 
-# ─────────────────────────────────────────────────────────────────
-#  VAD RECORDING
-# ─────────────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════
+#  AUDIO CAPTURE
+# ══════════════════════════════════════════════
 
 def capture_speech(timeout: float) -> Optional[np.ndarray]:
+    """Record audio until silence is detected or timeout is reached."""
     audio_q   = queue.Queue()
     blocksize = int(SAMPLE_RATE * CHUNK_SECS)
 
@@ -643,11 +424,13 @@ def capture_speech(timeout: float) -> Optional[np.ndarray]:
         audio_q.put(indata.copy())
 
     stream = sd.InputStream(
-        samplerate=SAMPLE_RATE, channels=CHANNELS,
-        dtype="float32", blocksize=blocksize, callback=callback,
+        samplerate=SAMPLE_RATE,
+        channels=CHANNELS,
+        dtype="float32",
+        blocksize=blocksize,
+        callback=callback,
     )
     stream.start()
-    gpio_set(True)
 
     speech_buffer: list            = []
     pre_buffer:    list            = []
@@ -669,9 +452,11 @@ def capture_speech(timeout: float) -> Optional[np.ndarray]:
             if rms >= ENERGY_THRESHOLD:
                 idle_clock    = time.time()
                 silence_start = None
+
                 if not recording:
-                    recording     = True
+                    recording = True
                     speech_buffer = list(pre_buffer)
+
                 speech_buffer.append(chunk)
 
             elif recording:
@@ -685,13 +470,13 @@ def capture_speech(timeout: float) -> Optional[np.ndarray]:
                 pre_buffer.append(chunk)
                 if len(pre_buffer) > PRE_ROLL_CHUNKS:
                     pre_buffer.pop(0)
+
                 if time.time() - idle_clock >= timeout:
                     return None
 
     finally:
         stream.stop()
         stream.close()
-        gpio_set(False)
 
     if not speech_buffer:
         return None
@@ -699,43 +484,53 @@ def capture_speech(timeout: float) -> Optional[np.ndarray]:
     audio = np.concatenate(speech_buffer, axis=0)
     return audio if len(audio) >= SAMPLE_RATE * MIN_SPEECH_SECS else None
 
-# ─────────────────────────────────────────────────────────────────
-#  TRANSCRIBE  — improved Hindi detection + filler removal
-# ─────────────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════
+#  TRANSCRIPTION
+# ══════════════════════════════════════════════
 
 def transcribe(audio: np.ndarray) -> Tuple[str, str]:
-    return _transcribe_with_model(audio, STT_MODEL)
+    """
+    Transcribe audio and detect language (English or Hindi).
 
-def transcribe_fast(audio: np.ndarray) -> Tuple[str, str]:
-    return _transcribe_with_model(audio, STT_MODEL_FAST)
-
-def _transcribe_with_model(audio: np.ndarray, model: str) -> Tuple[str, str]:
+    Raises:
+        NoInternetError       - if there's no internet connection.
+        AllKeysExhaustedError - if every Groq API key is rate-limited/exhausted.
+    """
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp_path = tmp.name
+
     sf.write(tmp_path, audio, SAMPLE_RATE)
 
     try:
-        with open(tmp_path, "rb") as f:
-            result = client.audio.transcriptions.create(
-                model=model,
-                file=f,
-                response_format="verbose_json",
-            )
+        def _do_transcribe(active_client: Groq):
+            with open(tmp_path, "rb") as f:
+                return active_client.audio.transcriptions.create(
+                    model=STT_MODEL,
+                    file=f,
+                    temperature=0,
+                    prompt=(
+                        "This is a general-purpose AI assistant. "
+                        "The user may ask about any topic in English or Hindi. "
+                        "Use Roman Hindi for Hindi speech. "
+                        "Transcribe accurately — do not skip words."
+                    ),
+                    response_format="verbose_json",
+                )
+
+        result = call_groq_with_fallback(_do_transcribe)
     finally:
         os.unlink(tmp_path)
 
     raw_text = (result.text or "").strip()
+    text = clean_transcription(raw_text)
 
-    # Guard: if transcription is only filler words, return empty
     if is_only_fillers(raw_text):
         return "", "en"
 
-    # Clean filler words from the transcript
-    text = clean_transcription(raw_text)
-
-    # Language detection — Layer 1: Whisper reported language
+    # Language detection — Layer 1: Whisper tag
     lang = (result.language or "en").strip().lower()
-    if lang in ("ur", "ur-PK"):
+    if lang == "ur":
         lang = "hi"
     if lang not in ("hi", "en"):
         lang = "en"
@@ -743,306 +538,123 @@ def _transcribe_with_model(audio: np.ndarray, model: str) -> Tuple[str, str]:
     # Layer 2: Devanagari / Arabic script scan
     for ch in raw_text:
         cp = ord(ch)
-        if 0x0900 <= cp <= 0x097F:
-            lang = "hi"; break
-        if 0x0600 <= cp <= 0x06FF:
-            lang = "hi"; break
+        if 0x0900 <= cp <= 0x097F or 0x0600 <= cp <= 0x06FF:
+            lang = "hi"
+            break
 
-    # Layer 3: Common Roman Hindi keywords (from Code B)
-    if any(w in _HINDI_ROMAN_WORDS for w in raw_text.lower().split()):
+    # Layer 3: Common Hindi words in Roman script
+    hindi_words = {
+        "hai", "haan", "nahi", "kya", "kaise", "kitna", "kitni",
+        "aap", "tum", "hum", "mein", "main", "kab", "ka", "ki",
+        "kar", "karna", "sakta", "sakti", "jana", "chahiye",
+        "batao", "bolo", "bata", "karo", "dono", "kyun", "kyunki",
+        "lekin", "aur", "ya", "agar", "toh", "woh", "yeh", "iska",
+        "uska", "inhe", "unhe", "accha", "theek", "bilkul",
+    }
+    if any(w in hindi_words for w in raw_text.lower().split()):
         lang = "hi"
 
     return text, lang
 
-# ─────────────────────────────────────────────────────────────────
+
+def clean_transcription(text: str) -> str:
+    """Remove filler words from transcription."""
+    fillers = {
+        "hmm", "hmmm", "umm", "um", "uh", "uhh", "ah", "ahh",
+        "mmm", "mm", "huh", "er", "erm", "accha", "acha", "achha",
+        "haan", "han", "theek", "theek hai", "haanji",
+        "mm-hmm", "mhm", "uh-huh", "okay", "ok", "right",
+        "yeah", "yep", "yup",
+    }
+    words = text.split()
+    cleaned = [w for w in words if w.lower().strip(".,!?") not in fillers]
+    return " ".join(cleaned).strip()
+
+
+def is_only_fillers(text: str) -> bool:
+    if not text:
+        return True
+    return clean_transcription(text).strip() == ""
+
+
+# ══════════════════════════════════════════════
 #  WAKE WORD
-# ─────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════
 
 def is_wake_word(text: str) -> bool:
-    for pattern in _WAKE_REGEXES:
-        if pattern.search(text):
-            return True
-    return False
-
-# ─────────────────────────────────────────────────────────────────
-#  WEB SEARCH — cached, timed-out, news-routed, 4-tier fallback
-# ─────────────────────────────────────────────────────────────────
-
-def _ddgs_text_search(query: str) -> str:
-    results = []
-    with DDGS() as ddgs:
-        for r in ddgs.text(query, max_results=5):
-            body = r.get("body", "")
-            if body:
-                results.append(f"{r.get('title', '')}: {body}")
-    return " | ".join(results)[:1500] if results else ""
+    lower = text.lower().strip()
+    return any(w in lower for w in WAKE_WORDS)
 
 
-def _ddgs_news_search(query: str) -> str:
-    results = []
-    with DDGS() as ddgs:
-        for r in ddgs.news(query, max_results=5):
-            title = r.get("title", "")
-            body  = r.get("body", "") or r.get("excerpt", "")
-            date  = r.get("date", "")
-            if title:
-                entry = f"[{date}] {title}: {body}" if date else f"{title}: {body}"
-                results.append(entry)
-    return " | ".join(results)[:1500] if results else ""
-
-
-def _wikipedia_lookup(query: str) -> str:
-    if not WIKIPEDIA_AVAILABLE:
-        return ""
-    try:
-        titles = _wikipedia_module.search(query, results=3)
-        if not titles:
-            return ""
-        summary = _wikipedia_module.summary(titles[0], sentences=3, auto_suggest=False)
-        return f"[Wikipedia — {titles[0]}] {summary}"
-    except _wikipedia_module.exceptions.DisambiguationError as e:
-        try:
-            summary = _wikipedia_module.summary(e.options[0], sentences=3, auto_suggest=False)
-            return f"[Wikipedia — {e.options[0]}] {summary}"
-        except Exception:
-            return ""
-    except Exception:
-        logger.exception("Wikipedia lookup failed")
-        return ""
-
-
-_UNVERIFIED_WARNING_EN = (
-    "Live information could not be verified through web search. "
-    "The following answer is based on my general knowledge and may not reflect recent updates. "
-)
-_UNVERIFIED_WARNING_HI = (
-    "Web search se live jaankari nahi mil payi. "
-    "Yeh jawab meri general knowledge par based hai aur recent updates reflect nahi kar sakta. "
-)
-
-
-def do_web_search(query: str, lang: str = "en") -> Tuple[str, bool]:
-    """
-    4-tier search pipeline. Returns (result_text, search_succeeded).
-    Tier 1: DDGS text/news | Tier 2: DDG Instant Answer API
-    Tier 3: Wikipedia      | Tier 4: empty + False
-    """
-    import urllib.request, urllib.parse
-
-    key = _cache_key(query)
-
-    if key in search_cache:
-        log_cache_hit(query)
-        return search_cache[key], True
-
-    result = ""
-
-    # Tier 1: DDGS
-    if DDGS_AVAILABLE:
-        is_news   = _is_news_query(query)
-        search_fn = _ddgs_news_search if is_news else _ddgs_text_search
-        mode      = "news" if is_news else "web"
-        log_search(query, mode)
-        try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(search_fn, query)
-                result = future.result(timeout=SEARCH_TIMEOUT_SECS)
-        except concurrent.futures.TimeoutError:
-            log_warn(f"DDGS timed out after {SEARCH_TIMEOUT_SECS}s")
-        except Exception as e:
-            logger.exception("DDGS search failure")
-            log_warn(f"DDGS search failed: {e}")
-
-    # Tier 2: DDG Instant Answer API
-    if not result:
-        log_search(query, "instant")
-        url = (
-            "https://api.duckduckgo.com/?q="
-            + urllib.parse.quote_plus(query)
-            + "&format=json&no_html=1&skip_disambig=1"
-        )
-        try:
-            with urllib.request.urlopen(url, timeout=5) as resp:
-                data = json.loads(resp.read().decode())
-            abstract = data.get("AbstractText", "").strip()
-            answer   = data.get("Answer", "").strip()
-            topics   = data.get("RelatedTopics", [])
-            if abstract:
-                result = abstract[:800]
-            elif answer:
-                result = answer[:800]
-            else:
-                for t in topics:
-                    if isinstance(t, dict) and t.get("Text"):
-                        result = t["Text"][:800]
-                        break
-        except Exception as e:
-            logger.exception("DDG Instant Answer API failure")
-            log_warn(f"DDG Instant Answer failed: {e}")
-
-    # Tier 3: Wikipedia
-    if not result:
-        log_search(query, "wikipedia")
-        result = _wikipedia_lookup(query)
-        if result:
-            log_result(result)
-
-    if not result:
-        log_warn("All search tiers failed — LLM will answer with unverified warning")
-        return "", False
-
-    search_cache[key] = result
-    log_result(result)
-    return result, True
-
-# ─────────────────────────────────────────────────────────────────
-#  LLM REPLY  — with hybrid intent routing + follow-up enrichment
-# ─────────────────────────────────────────────────────────────────
-
-def clean_text(text: str) -> str:
-    text = re.sub(r"[*_`~^#\[\]{}<>•]", "", text)
-    text = re.sub(r"\s{2,}", " ", text)
-    return text.strip()
-
+# ══════════════════════════════════════════════
+#  AI REPLY
+# ══════════════════════════════════════════════
 
 def get_ai_reply(user_text: str, lang: str) -> str:
-    global _last_user_text
+    """
+    Get a reply from the LLM.
 
-    # Route 1: Local clock (no network, no LLM)
-    if is_time_query(user_text):
-        log_state("Time query — answering from local clock (IST)")
-        dt_str = get_local_datetime()
-        if lang == "hi":
-            return f"Abhi IST ke hisaab se: {dt_str}"
-        return dt_str
+    Raises:
+        NoInternetError       - if there's no internet connection.
+        AllKeysExhaustedError - if every Groq API key is rate-limited/exhausted.
+    """
+    global last_user_text
 
-    system       = SYSTEM_HI if lang == "hi" else SYSTEM_EN
-    lang_history = _history[lang]
+    lang_history = history[lang]
 
-    # Context enrichment for short follow-up queries (from Code B)
-    # e.g. "did they win?" after discussing a match
+    # Enrich short follow-up queries with prior context
     contextual_input = user_text
-    prior = _last_user_text.get(lang, "")
-    if prior and len(user_text.split()) <= 6:
-        contextual_input = f"[Follow-up to: {prior}] {user_text}"
+    if last_user_text and len(user_text.split()) <= 6:
+        contextual_input = (
+            f"Previous question: {last_user_text}\n"
+            f"Follow-up: {user_text}"
+        )
+
+    system = build_system_with_search(contextual_input, lang)
 
     lang_history.append({"role": "user", "content": contextual_input})
-    messages = [{"role": "system", "content": system}, *lang_history[-HISTORY_WINDOW:]]
 
-    # Route 2: Hybrid live-data check
-    if requires_live_data(user_text, last_user_text=prior):
-        log_state("Live-data query — running web search pipeline")
-        search_result, search_ok = do_web_search(user_text, lang)
-
-        if search_ok:
-            messages.append({
-                "role":       "assistant",
-                "content":    "",
-                "tool_calls": [{
-                    "id":       "forced_search_1",
-                    "type":     "function",
-                    "function": {
-                        "name":      "web_search",
-                        "arguments": json.dumps({"query": user_text}),
-                    },
-                }],
-            })
-            messages.append({
-                "role":         "tool",
-                "tool_call_id": "forced_search_1",
-                "content":      search_result,
-            })
-        else:
-            warning = _UNVERIFIED_WARNING_HI if lang == "hi" else _UNVERIFIED_WARNING_EN
-            log_warn("Prepending unverified-data warning to LLM reply")
-            messages.append({
-                "role":    "user",
-                "content": (
-                    f"{warning}"
-                    f"Please answer this question based on your general knowledge: {user_text}"
-                ),
-            })
-
-    # Route 3: LLM call (also handles continuation of Route 2)
-    try:
-        response = client.chat.completions.create(
+    def _do_chat(active_client: Groq):
+        return active_client.chat.completions.create(
             model=CHAT_MODEL,
-            messages=messages,
-            tools=[WEB_SEARCH_TOOL],
-            tool_choice="auto",
+            messages=[
+                {"role": "system", "content": system},
+                *lang_history,
+            ],
             max_tokens=MAX_TOKENS,
-            temperature=CHAT_TEMPERATURE,
-        )
-        msg = response.choices[0].message
-
-        # Tool-use loop (handles multi-call chains)
-        while msg.tool_calls:
-            messages.append({
-                "role":       "assistant",
-                "content":    msg.content or "",
-                "tool_calls": [
-                    {
-                        "id":       tc.id,
-                        "type":     "function",
-                        "function": {
-                            "name":      tc.function.name,
-                            "arguments": tc.function.arguments,
-                        },
-                    }
-                    for tc in msg.tool_calls
-                ],
-            })
-            for tc in msg.tool_calls:
-                if tc.function.name == "web_search":
-                    args  = json.loads(tc.function.arguments)
-                    query = args.get("query", user_text)
-                    result, _ = do_web_search(query, lang)
-                    if not result:
-                        result = "Web search unavailable right now."
-                    messages.append({
-                        "role":         "tool",
-                        "tool_call_id": tc.id,
-                        "content":      result,
-                    })
-            response = client.chat.completions.create(
-                model=CHAT_MODEL,
-                messages=messages,
-                max_tokens=MAX_TOKENS,
-                temperature=CHAT_TEMPERATURE,
-            )
-            msg = response.choices[0].message
-
-        reply = clean_text(msg.content or "")
-
-    except Exception as exc:
-        logger.exception("LLM call failed")
-        log_error(f"LLM error: {exc}")
-        reply = (
-            "Sorry, I am having trouble right now. Please try again in a moment."
-            if lang == "en" else
-            "Maafi chahta hoon, abhi connection mein problem hai. Dobara try karein."
+            temperature=0.4,
         )
 
-    reply = reply or (
-        "I could not find a good answer for that."
-        if lang == "en" else
-        "Is sawaal ka jawab abhi nahi mil paya."
-    )
+    try:
+        response = call_groq_with_fallback(_do_chat)
+    except (NoInternetError, AllKeysExhaustedError):
+        # Roll back the user message we just appended since we
+        # weren't able to get a reply for it.
+        lang_history.pop()
+        raise
+
+    reply = response.choices[0].message.content.strip()
+
+    # Strip markdown formatting (shouldn't appear in TTS output)
+    reply = re.sub(r'\*+', '', reply)
+    reply = re.sub(r'#+\s*', '', reply)
+    reply = re.sub(r'`+', '', reply)
 
     lang_history.append({"role": "assistant", "content": reply})
+    last_user_text = user_text
 
-    # Update last-user-text tracker for follow-up context
-    _last_user_text[lang] = user_text
+    # Keep history bounded to last 10 exchanges
+    if len(lang_history) > 20:
+        history[lang] = lang_history[-20:]
 
     return reply
 
-# ─────────────────────────────────────────────────────────────────
-#  TTS
-# ─────────────────────────────────────────────────────────────────
 
-pygame.mixer.init()
+# ══════════════════════════════════════════════
+#  TTS / SPEAK
+# ══════════════════════════════════════════════
 
-def pick_voice(lang: str, text: str = "") -> str:
+def pick_voice(text: str, lang: str) -> str:
     if lang == "hi":
         return TTS_VOICE_HI
     for ch in text:
@@ -1052,139 +664,183 @@ def pick_voice(lang: str, text: str = "") -> str:
     return TTS_VOICE_EN
 
 
-async def _tts_save(text: str, path: str, voice: str):
-    await edge_tts.Communicate(text, voice=voice).save(path)
+async def _tts(text: str, path: str, voice: str):
+    text = str(text).strip()
+    if not text:
+        text = "Sorry, I could not understand."
+    text = text.replace("*", "").replace("#", "").replace("`", "")
+    try:
+        communicate = edge_tts.Communicate(text=text, voice=voice)
+        await communicate.save(path)
+    except Exception as e:
+        print(f"⚠️ TTS Error: {e}")
+        fallback = edge_tts.Communicate(
+            text="Sorry, there was a voice generation problem.",
+            voice="en-US-JennyNeural",
+        )
+        await fallback.save(path)
 
 
 def speak(text: str, lang: str = "en"):
-    if not text.strip():
-        return
-
-    voice = pick_voice(lang, text)
-    log_bot(text, lang)
+    """Convert text to speech and play it. Blocks until playback completes."""
+    voice = pick_voice(text, lang)
+    print(f"   🔊 Voice → {voice}")
 
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
         tmp_path = tmp.name
 
-    asyncio.run(_tts_save(text, tmp_path, voice))
+    try:
+        asyncio.run(_tts(text, tmp_path, voice))
+    except Exception as e:
+        print(f"⚠️ Async TTS Error: {e}")
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        return
+
     pygame.mixer.music.load(tmp_path)
     pygame.mixer.music.play()
 
+    # Wait for playback to finish
     while pygame.mixer.music.get_busy():
-        pygame.time.wait(100)
+        pygame.time.wait(50)
 
     pygame.mixer.music.unload()
-    try:
+    if os.path.exists(tmp_path):
         os.unlink(tmp_path)
-    except OSError:
-        pass
 
-# ─────────────────────────────────────────────────────────────────
-#  CHATBOT STATE MACHINE  — with strong error recovery
-# ─────────────────────────────────────────────────────────────────
 
-def chatbot_loop():
+# ══════════════════════════════════════════════
+#  HELPERS
+# ══════════════════════════════════════════════
+
+def print_banner():
+    print("\n" + "=" * 60)
+    print("  🌐 GlobalBot — Your All-Knowing AI Assistant")
+    print("=" * 60)
+    print(f"  Loaded {len(GROQ_API_KEYS)} Groq API key(s) for fallback")
+    print("  Live web search for current events")
+    print("  States:")
+    print("    👂 LISTENING  — auto-detects your voice")
+    print(f"    😴 IDLE       — {int(IDLE_TIMEOUT)}s silence → idle")
+    print("                   say 'Hello' to wake up")
+    print("  Ctrl+C to quit")
+    print("=" * 60 + "\n")
+
+
+def state_label(state: State) -> str:
+    return {
+        State.IDLE:      "😴 IDLE",
+        State.LISTENING: "👂 LISTENING",
+        State.SPEAKING:  "🔊 SPEAKING",
+    }[state]
+
+
+# ══════════════════════════════════════════════
+#  MAIN LOOP
+# ══════════════════════════════════════════════
+
+def main():
+    print_banner()
+
     state = State.LISTENING
-    reply = ""
     lang  = "en"
+    reply = ""
 
-    greeting = (
-        "Hello! I'm GlobalBot, your AI assistant. "
-        "I search the web when needed. Ask me anything!"
+    speak(
+        "Hello! I'm GlobalBot, your all-knowing AI assistant. "
+        "What would you like to know?",
+        lang="en",
     )
-    speak(greeting, "en")
 
-    while True:
-        try:
+    try:
+        while True:
 
-            # IDLE: wait for wake word
+            # ── IDLE ──────────────────────────────────
             if state == State.IDLE:
-                log_state("IDLE — waiting for wake word...")
+                print(f"\n{state_label(state)}  — say 'Hello' to activate...")
+
                 audio = capture_speech(timeout=IDLE_POLL_TIMEOUT)
                 if audio is None:
                     continue
-                wake_text, _ = transcribe_fast(audio)
-                log_user(wake_text, "en")
+
+                print("🔍 Checking for wake word...")
+                try:
+                    wake_text, _ = transcribe(audio)
+                except NoInternetError:
+                    print("   ⚠️ No internet connection.")
+                    speak(NO_INTERNET_MESSAGE["en"], lang="en")
+                    continue
+                except AllKeysExhaustedError:
+                    print("   ⚠️ All API keys exhausted / server unreachable.")
+                    speak(NO_SERVER_MESSAGE["en"], lang="en")
+                    continue
+
+                print(f"   Heard: {wake_text!r}")
+
                 if is_wake_word(wake_text):
-                    state  = State.LISTENING
-                    wakeup = "Haan, boliye." if lang == "hi" else "Yes, I'm listening."
-                    speak(wakeup, lang)
+                    state = State.LISTENING
+                    print("\n✅ Wake word detected!")
+                    speak("Hello! I'm listening. What would you like to know?", lang="en")
+                else:
+                    print("   Not a wake word — staying idle.")
                 continue
 
-            # LISTENING: capture and transcribe
+            # ── LISTENING ─────────────────────────────
             if state == State.LISTENING:
-                log_state(f"Listening... (timeout {IDLE_TIMEOUT:.0f}s)")
+                print(f"\n{state_label(state)}  — silence for {int(IDLE_TIMEOUT)}s → idle")
+
                 audio = capture_speech(timeout=IDLE_TIMEOUT)
 
                 if audio is None:
-                    state    = State.IDLE
-                    idle_msg = (
-                        "Idle mode mein ja raha hoon. Hello kahiye jab zaroorat ho."
-                        if lang == "hi" else
-                        "Going idle. Say Hello when you need me."
-                    )
-                    speak(idle_msg, lang)
+                    state = State.IDLE
+                    print(f"\n⏱️  No speech for {int(IDLE_TIMEOUT)}s — going idle.")
+                    speak("Going to sleep now. Say 'Hello' when you need me.", lang="en")
                     continue
 
-                log_state("Transcribing speech...")
-                user_text, lang = transcribe(audio)
+                print("🔍 Transcribing...")
+                try:
+                    user_text, lang = transcribe(audio)
+                except NoInternetError:
+                    print("   ⚠️ No internet connection.")
+                    speak(NO_INTERNET_MESSAGE.get(lang, NO_INTERNET_MESSAGE["en"]), lang=lang)
+                    continue
+                except AllKeysExhaustedError:
+                    print("   ⚠️ All API keys exhausted / server unreachable.")
+                    speak(NO_SERVER_MESSAGE.get(lang, NO_SERVER_MESSAGE["en"]), lang=lang)
+                    continue
 
                 if not user_text:
-                    log_warn("Empty transcript — re-listening")
+                    print("⚠️  Could not understand — listening again.")
                     continue
 
-                log_user(user_text, lang)
-                log_state("Thinking...")
-                reply = get_ai_reply(user_text, lang)
+                print(f"   You [{lang.upper()}] › {user_text}")
+
+                print("🤔 Thinking...")
+                try:
+                    reply = get_ai_reply(user_text, lang)
+                except NoInternetError:
+                    print("   ⚠️ No internet connection.")
+                    speak(NO_INTERNET_MESSAGE.get(lang, NO_INTERNET_MESSAGE["en"]), lang=lang)
+                    continue
+                except AllKeysExhaustedError:
+                    print("   ⚠️ All API keys exhausted / server unreachable.")
+                    speak(NO_SERVER_MESSAGE.get(lang, NO_SERVER_MESSAGE["en"]), lang=lang)
+                    continue
+
+                print(f"   AI  [{lang.upper()}] › {reply}")
+
                 state = State.SPEAKING
                 continue
 
-            # SPEAKING: speak reply, then return to listening
+            # ── SPEAKING ──────────────────────────────
             if state == State.SPEAKING:
+                print(f"\n{state_label(state)}")
                 speak(reply, lang)
                 state = State.LISTENING
                 continue
 
-        except KeyboardInterrupt:
-            raise
-
-        except Exception as exc:
-            logger.exception("Unhandled exception in chatbot loop")
-            log_error(f"Unexpected error in chatbot loop: {exc}")
-            try:
-                apology = (
-                    "Something went wrong on my end. Please ask again."
-                    if lang == "en" else
-                    "Kuch gadbad ho gayi. Dobara poochein please."
-                )
-                speak(apology, lang)
-            except Exception:
-                logger.exception("speak() also failed during error recovery")
-            state = State.LISTENING
-
-# ─────────────────────────────────────────────────────────────────
-#  ENTRY POINT
-# ─────────────────────────────────────────────────────────────────
-
-def main():
-    gpio_setup()
-    run_self_test()
-
-    banner(
-        f"🌐  GlobalBot v3.0  |  Model: {CHAT_MODEL}  |  "
-        f"Search: {'DDGS' if DDGS_AVAILABLE else 'Fallback API'}  |  "
-        f"Wiki: {'✔' if WIKIPEDIA_AVAILABLE else '✖'}  |  "
-        f"Classifier: {CLASSIFIER_MODEL}",
-        C.GREEN,
-    )
-
-    try:
-        chatbot_loop()
     except KeyboardInterrupt:
-        print(f"\n{C.YELLOW}Interrupted by user.{C.RESET}")
-    finally:
-        gpio_cleanup()
-        print(f"{C.GREEN}Shutdown complete.{C.RESET}\n")
+        print("\n\n👋 Shutting down GlobalBot. Goodbye!")
 
 
 if __name__ == "__main__":
